@@ -35,6 +35,7 @@ sudo ./setup_wireguard_client.sh 2
 ```
 
 - It should produce a WireGuard peer configuration file `peer2.conf`. You can import this configuration file in your WireGuard client application to connect to the VPN server, setting up a secure tunnel.
+- For mobile users, the script also displays a QR code in the terminal. You can simply scan this QR code from your WireGuard mobile app to import the configuration instantly.
 - To check if tunneling is working, lookup your public IP address @ <https://ipinfo.io/ip>.
 
 ```bash

@@ -50,7 +50,7 @@ echo "[+] Going ahead with setting up WireGuard server."
 
 echo "[+] Updating system and installing WireGuard."
 sudo apt-get update
-sudo apt-get install wireguard -y
+sudo apt-get install wireguard qrencode -y
 
 echo "[+] Generating WireGuard server private + public keypair."
 WG_PRIV_KEY=$(wg genkey)
@@ -184,6 +184,8 @@ sudo wg set wg0 peer "$PEER_PUB_KEY" allowed-ips "$PEER_IPV4_ADDRESS,$PEER_IPV6_
 
 echo "[+] WireGuard peer configuration file '$CONFIG_FILE' is ready."
 echo "[+] Use it with your WireGuard client application."
+echo "[+] Alternatively, scan the QR code below from your WireGuard mobile app."
+qrencode -t ansiutf8 < "$CONFIG_FILE"
 EOF
 
 # Now, use `sed` to substitute the placeholder values with the actual
