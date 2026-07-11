@@ -1,0 +1,264 @@
+#!/usr/bin/env bash
+# Add a WireGuard client and persist it in wg0.conf.
+set -euo pipefail
+IFS=$'\n\t'
+
+readonly WG_DIR=/etc/wireguard CONFIG=/etc/wireguard/wg0.conf
+readonly CLIENT_DIR=/etc/wireguard/clients KEY_DIR=/etc/wireguard/keys
+# shellcheck source=/usr/local/lib/wireguard-toolkit/common.sh
+source /usr/local/lib/wireguard-toolkit/common.sh
+LOCK_FD=9
+
+die() { printf 'wg-add-client: %s\n' "$*" >&2; exit 1; }
+require_root() { [[ ${EUID} -eq 0 ]] || die 'must be run as root'; }
+validate_name() { [[ ${1:-} =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$ ]] || die 'client name must contain only letters, digits, _ or - (maximum 64 characters)'; }
+sync_config() { wg syncconf wg0 <(wg-quick strip wg0); }
+
+
+int_to_ipv4() {
+    local value=$1
+    printf '%d.%d.%d.%d\n' "$((value >> 24 & 255))" "$((value >> 16 & 255))" "$((value >> 8 & 255))" "$((value & 255))"
+}
+
+interface_addresses() {
+    awk -F= '/^[[:space:]]*Address[[:space:]]*=/ { print $2 }' "$CONFIG" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+}
+
+next_ipv4() {
+    local cidr ip bits base size first last candidate entry entry_ip entry_bits entry_value range_index conflict server_value
+    local -a range_starts=() range_ends=()
+    cidr=$(interface_addresses | awk 'index($0, ".") { print; exit }')
+    [[ $cidr == */* ]] || die 'no IPv4 interface subnet found in wg0.conf'
+    ip=${cidr%/*}; bits=${cidr#*/}
+    [[ $bits =~ ^[0-9]+$ ]] || die 'invalid IPv4 prefix in wg0.conf'
+    bits=$((10#$bits))
+    (( bits >= 1 && bits <= 30 )) || die 'IPv4 prefix must be between /1 and /30'
+    server_value=$(ipv4_to_int "$ip") || die 'invalid IPv4 interface address in wg0.conf'
+    base=$(( server_value & (0xFFFFFFFF << (32 - bits)) ))
+    size=$(( 1 << (32 - bits) )); first=$((base + 1)); last=$((base + size - 2))
+    while IFS= read -r entry; do
+        [[ $entry == *.* ]] || continue
+        [[ $entry == */* ]] || die "IPv4 AllowedIPs entry lacks a prefix: $entry"
+        entry_ip=${entry%/*}; entry_bits=${entry#*/}
+        [[ $entry_bits =~ ^[0-9]+$ ]] || die "invalid IPv4 prefix in AllowedIPs: $entry"
+        entry_bits=$((10#$entry_bits))
+        (( entry_bits >= 0 && entry_bits <= 32 )) || die "invalid IPv4 prefix in AllowedIPs: $entry"
+        entry_value=$(ipv4_to_int "$entry_ip") || die "invalid IPv4 address in AllowedIPs: $entry"
+        if (( entry_bits == 0 )); then
+            range_starts+=(0); range_ends+=(4294967295)
+        else
+            base=$(( entry_value & (0xFFFFFFFF << (32 - entry_bits)) ))
+            size=$((1 << (32 - entry_bits)))
+            range_starts+=("$base"); range_ends+=("$((base + size - 1))")
+        fi
+    done < <(awk -F= '/^[[:space:]]*AllowedIPs[[:space:]]*=/ { print $2 }' "$CONFIG" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    for ((candidate = first; candidate <= last; candidate++)); do
+        ip=$(int_to_ipv4 "$candidate")
+        [[ $candidate -eq $server_value ]] && continue
+        conflict=0
+        for range_index in "${!range_starts[@]}"; do
+            if (( candidate >= range_starts[range_index] && candidate <= range_ends[range_index] )); then
+                conflict=1
+                # Skip the whole occupied range instead of walking large CIDRs
+                # one address at a time.
+                candidate=${range_ends[$range_index]}
+                break
+            fi
+        done
+        (( conflict )) || { printf '%s\n' "$ip"; return; }
+    done
+    die 'the WireGuard IPv4 subnet has no free client address'
+}
+
+next_ipv6() {
+    local cidr address suffix candidate entry entry_address entry_bits normalized_candidate conflict server_normalized
+    local block_size range_end network_tail
+    local -a server_parts=()
+    local -a used_networks=() used_prefixes=()
+    cidr=$(interface_addresses | awk 'index($0, ":") { print; exit }')
+    [[ $cidr == */64 ]] || die 'the toolkit requires a /64 IPv6 interface subnet'
+    address=${cidr%/*}
+    [[ $address == *::* ]] || die 'IPv6 interface address must use compressed :: notation'
+    server_normalized=$(normalize_ipv6 "$address") || die 'invalid IPv6 interface address in wg0.conf'
+    IFS=: read -r -a server_parts <<< "$server_normalized"
+    while IFS= read -r entry; do
+        [[ $entry == *:* ]] || continue
+        [[ $entry == */* ]] || die "IPv6 AllowedIPs entry lacks a prefix: $entry"
+        entry_address=${entry%/*}; entry_bits=${entry#*/}
+        [[ $entry_bits =~ ^[0-9]+$ ]] || die "invalid IPv6 prefix in AllowedIPs: $entry"
+        entry_bits=$((10#$entry_bits))
+        (( entry_bits >= 0 && entry_bits <= 128 )) || die "invalid IPv6 prefix in AllowedIPs: $entry"
+        entry_address=$(normalize_ipv6 "$entry_address") || die "invalid IPv6 address in AllowedIPs: $entry"
+        used_networks+=("$entry_address"); used_prefixes+=("$entry_bits")
+    done < <(awk -F= '/^[[:space:]]*AllowedIPs[[:space:]]*=/ { print $2 }' "$CONFIG" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    for ((candidate = 2; candidate <= 65535; candidate++)); do
+        printf -v suffix '%x' "$candidate"
+        address="${server_parts[0]}:${server_parts[1]}:${server_parts[2]}:${server_parts[3]}::${suffix}"
+        normalized_candidate=$(normalize_ipv6 "$address")
+        [[ $normalized_candidate == "$server_normalized" ]] && continue
+        conflict=0
+        for entry in "${!used_networks[@]}"; do
+            if ipv6_in_cidr "$normalized_candidate" "${used_networks[$entry]}" "${used_prefixes[$entry]}"; then
+                conflict=1
+                entry_bits=${used_prefixes[$entry]}
+                if (( entry_bits <= 112 )); then
+                    die 'the WireGuard IPv6 managed range is fully occupied by an existing AllowedIPs route'
+                fi
+                block_size=$((1 << (128 - entry_bits)))
+                network_tail=$((16#${used_networks[$entry]##*:}))
+                range_end=$(( (network_tail & ~(block_size - 1)) + block_size - 1 ))
+                (( range_end > candidate )) && candidate=$range_end
+                break
+            fi
+        done
+        (( conflict )) || { printf '%s\n' "$address"; return; }
+    done
+    die 'the WireGuard IPv6 subnet has no free client address in the managed range'
+}
+
+ipv6_in_cidr() {
+    local candidate=$1 network=$2 bits=$3 full remainder index mask
+    local -a candidate_parts=() network_parts=()
+    IFS=: read -r -a candidate_parts <<< "$candidate"
+    IFS=: read -r -a network_parts <<< "$network"
+    full=$((bits / 16)); remainder=$((bits % 16))
+    for ((index = 0; index < full; index++)); do
+        [[ ${candidate_parts[$index]} == "${network_parts[$index]}" ]] || return 1
+    done
+    if (( remainder > 0 )); then
+        mask=$(( (0xFFFF << (16 - remainder)) & 0xFFFF ))
+        (( (16#${candidate_parts[$full]} & mask) == (16#${network_parts[$full]} & mask) )) || return 1
+    fi
+    return 0
+}
+
+
+server_value() {
+    local key=$1
+    awk -v key="$key" '
+        $0 ~ "^[[:space:]]*" key "[[:space:]]*=" {
+            value=substr($0, index($0, "=") + 1)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+            print value
+            exit
+        }
+    ' "$CONFIG"
+}
+endpoint_value() { sed -n 's/^# Endpoint: //p' "$CONFIG" | head -n 1; }
+
+
+warn_stale_artifacts() {
+    local artifact
+    local -a artifacts=()
+    shopt -s nullglob
+    artifacts=("$WG_DIR"/.wg0.conf.* "$WG_DIR"/.remove-client.* "$WG_DIR"/.public.key.*)
+    shopt -u nullglob
+    for artifact in "${artifacts[@]}"; do
+        printf 'wg-add-client: WARNING: stale transaction artifact found; review it manually: %s\n' "$artifact" >&2
+    done
+    (( ${#artifacts[@]} == 0 )) || die 'refusing to continue while stale transaction artifacts exist'
+}
+
+cleanup() {
+    local status=$?
+    local restore_failed=0
+    trap - EXIT INT TERM HUP
+    if (( ! committed && config_replaced )) && [[ -n ${backup:-} && -e $backup ]]; then
+        if cp -a "$backup" "$CONFIG"; then
+            if ! sync_config >/dev/null 2>&1; then
+                printf 'wg-add-client: WARNING: wg0.conf was restored, but the live interface could not be restored; run: wg syncconf wg0 <(wg-quick strip wg0)\n' >&2
+                restore_failed=1
+            fi
+        else
+            printf 'wg-add-client: WARNING: failed to restore wg0.conf; recovery backup remains at %s\n' "$backup" >&2
+            restore_failed=1
+        fi
+    fi
+    rm -f "${tmp_client:-}" "${tmp_config:-}"
+    if (( ! restore_failed )); then rm -f "${backup:-}"; backup=''; fi
+    if (( ! committed && ! restore_failed )); then
+        rm -f "$private_file" "$public_file" "$psk_file" "$client_config" "$png_file"
+    fi
+    exit "$status"
+}
+
+main() {
+    require_root
+    [[ $# -eq 1 ]] || die 'usage: wg-add-client CLIENT'
+    local name=$1 private_file public_file psk_file client_config png_file
+    local private_key public_key psk server_public config_private config_public endpoint port ipv4 ipv6
+    local tmp_config tmp_client backup committed=0 config_replaced=0
+    validate_name "$name"
+    exec 9>"$WG_DIR/.toolkit.lock"; flock -x "$LOCK_FD"
+    warn_stale_artifacts
+    private_file="$KEY_DIR/$name.key"; public_file="$KEY_DIR/$name.pub"; psk_file="$KEY_DIR/$name.psk"
+    client_config="$CLIENT_DIR/$name.conf"; png_file="$CLIENT_DIR/$name.png"
+    [[ ! -e $private_file && ! -e $public_file && ! -e $psk_file && ! -e $client_config && ! -e $png_file ]] || die "client '$name' already exists"
+    grep -Fqx "# Client: $name" "$CONFIG" && die "client '$name' already exists"
+
+    ipv4=$(next_ipv4); ipv6=$(next_ipv6)
+    private_key=$(wg genkey); public_key=$(wg pubkey <<< "$private_key"); psk=$(wg genpsk)
+    config_private=$(server_value PrivateKey)
+    [[ -n $config_private ]] || die 'missing interface PrivateKey in wg0.conf'
+    server_public=$(wg pubkey < "$WG_DIR/private.key") || die 'unable to derive the server public key'
+    config_public=$(wg pubkey <<< "$config_private" 2>/dev/null) || die 'invalid interface PrivateKey in wg0.conf'
+    [[ $config_public == "$server_public" ]] || die 'the PrivateKey in wg0.conf does not match /etc/wireguard/private.key'
+    endpoint=$(endpoint_value); port=$(server_value ListenPort)
+    [[ -n $endpoint ]] || die 'missing "# Endpoint: host" in wg0.conf'
+    validate_endpoint "$endpoint"
+    if ! [[ $port =~ ^[1-9][0-9]{0,4}$ ]] || ! (( 10#$port <= 65535 )); then
+        die 'ListenPort in wg0.conf must be between 1 and 65535'
+    fi
+    tmp_client=''; tmp_config=''; backup=''
+    # Until the config reload succeeds, any failure leaves no half-created client.
+    trap cleanup EXIT
+    trap 'exit 130' INT TERM HUP
+    umask 077
+    printf '%s\n' "$private_key" > "$private_file"
+    printf '%s\n' "$public_key" > "$public_file"
+    printf '%s\n' "$psk" > "$psk_file"
+    tmp_client=$(mktemp "$CLIENT_DIR/.${name}.conf.XXXXXX")
+    tmp_config=$(mktemp "$WG_DIR/.wg0.conf.XXXXXX")
+    cat > "$tmp_client" <<EOF
+[Interface]
+PrivateKey = $private_key
+Address = $ipv4/32, $ipv6/128
+DNS = 1.1.1.1, 1.0.0.1, 2606:4700:4700::1111, 2606:4700:4700::1001
+MTU = 1420
+
+[Peer]
+PublicKey = $server_public
+PresharedKey = $psk
+AllowedIPs = 0.0.0.0/0, ::/0
+Endpoint = $endpoint:$port
+PersistentKeepalive = 25
+EOF
+    qrencode -t PNG -o "$png_file" < "$tmp_client"
+    cat "$CONFIG" > "$tmp_config"
+    cat >> "$tmp_config" <<EOF
+
+# Client: $name
+[Peer]
+PublicKey = $public_key
+PresharedKey = $psk
+AllowedIPs = $ipv4/32, $ipv6/128
+EOF
+    chmod 600 "$tmp_config" "$tmp_client" "$png_file"
+    mv "$tmp_client" "$client_config"
+    backup=$(mktemp "$WG_DIR/.wg0.conf.backup.XXXXXX")
+    cp -a "$CONFIG" "$backup"
+    config_replaced=1
+    mv "$tmp_config" "$CONFIG"
+    if ! sync_config; then
+        die 'reload failed; changes were rolled back'
+    fi
+    committed=1
+    rm -f "$backup"; backup=''
+    printf 'Client %s added: %s, %s\n\n' "$name" "$ipv4" "$ipv6"
+    if ! qrencode -t ANSIUTF8 < "$client_config"; then
+        printf 'Warning: client was added, but the terminal QR code could not be displayed.\n' >&2
+    fi
+    printf '\nConfiguration: %s\nQR image: %s\n' "$client_config" "$png_file"
+    trap - EXIT INT TERM HUP
+}
+main "$@"

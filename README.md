@@ -1,65 +1,126 @@
-# setup-wireguard-vpn
+# WireGuard management toolkit
 
-BASH script for easy set up of WireGuard VPN Server and Clients
+A small, file-based WireGuard server and client-management toolkit written in
+Bash. It targets Debian 12+ and Ubuntu 22.04+ and has no Docker, database, or
+web UI dependencies.
 
-## How to setup a WireGuard server on Linux VM and connect clients to it?
+## Install the server
 
-> [!NOTE]
-> A blog post on "Host Your Own VPN Server" @ <https://itzmeanjan.in/pages/host-your-own-vpn_server.html>, guides you through using this BASH script.
-
-- Get yourself a $5/month VPS on AWS Lightsail or DigitalOcean.
-- SSH into the machine, clone this repository.
+Run the installer as root on a host with a default network route:
 
 ```bash
-git clone https://github.com/itzmeanjan/setup-wireguard-vpn
-```
-
-- Execute BASH script on the machine. It should setup a WireGuard VPN server on your VPS.
-
-```bash
-pushd setup-wireguard-vpn
 sudo ./setup_wireguard_server.sh
 ```
 
-- Check the status of WireGuard VPN server running with following command.
+Keep `setup_wireguard_server.sh`, `wg-add-client`, `wg-remove-client`,
+`wg-list-clients`, and `wireguard-toolkit-common.sh` in the same directory when
+installing. The installer copies the three commands into `/usr/local/bin` and
+their shared parsing library into `/usr/local/lib/wireguard-toolkit`; the
+commands do not inherit variables from the installer.
+
+The endpoint defaults to the source IPv4 address selected for internet traffic,
+but only when that address is public. If the detected address is private or
+otherwise non-public, installation stops and requires `WG_ENDPOINT`. On a NATed
+server, or when using a DNS name, provide the public endpoint explicitly.
+Bracket an IPv6 endpoint, as required by WireGuard configuration syntax.
 
 ```bash
-sudo wg
+sudo WG_ENDPOINT=vpn.example.com ./setup_wireguard_server.sh
 ```
 
-- Go to network configuration page of VPS console and open port `51820`. The WireGuard VPN server is expecting peer connection on that port.
-- Executing WireGuard server setup script should generate another script `setup_wireguard_client.sh`. Let's execute that for setting up our first WireGuard client, with `PEER_ID=2`.
+The installer:
+
+- installs WireGuard, `qrencode`, and the required firewall tooling;
+- creates `/etc/wireguard/wg0.conf` without `SaveConfig`;
+- enables IPv4 and IPv6 forwarding and NAT;
+- detects an active UFW firewall and adds the WireGuard listener and forwarding
+  rules without enabling, disabling, or resetting UFW;
+- enables and starts `wg-quick@wg0`;
+- installs `wg-add-client`, `wg-remove-client`, and `wg-list-clients` in
+  `/usr/local/bin`.
+
+If `/etc/wireguard/wg0.conf` already exists, the installer preserves and
+validates it rather than overwriting it. Installation stops if it does not meet
+these requirements:
+
+- not enable `SaveConfig` (`SaveConfig = false` is accepted);
+- contain compatible IPv4 and compressed `/64` IPv6 interface addresses;
+- contain a numeric `ListenPort`;
+- contain a `# Endpoint: HOST` comment using a hostname, IPv4 address, or
+  bracketed IPv6 address without an embedded port;
+- use unique `# Client: NAME` comments whose names contain only letters,
+  digits, `_`, or `-` and are at most 64 characters;
+- contain toolkit-compatible NAT `PostUp` and `PreDown` rules using the order
+  `iptables -t nat -A|-I POSTROUTING -o INTERFACE -j MASQUERADE` for startup and
+  `iptables -t nat -D POSTROUTING -o INTERFACE -j MASQUERADE` for shutdown,
+  with equivalent `ip6tables` rules; the installer does not inject NAT rules
+  into a preserved configuration;
+- use the private key stored in `/etc/wireguard/private.key`, so that
+  `/etc/wireguard/public.key` and generated client configurations identify the
+  correct server.
+
+If UFW is installed and active, the installer idempotently allows the configured
+WireGuard UDP port (`51820` by default) and forwarding from `wg0` to the detected
+external interface. It does not install or enable UFW and leaves unrelated
+rules unchanged. You must still allow the configured UDP port in any separate
+provider firewall or security group.
+
+## Manage clients
+
+Add a named client:
 
 ```bash
-sudo ./setup_wireguard_client.sh 2
+sudo wg-add-client iphone
 ```
 
-- It should produce a WireGuard peer configuration file `peer2.conf`. You can import this configuration file in your WireGuard client application to connect to the VPN server, setting up a secure tunnel.
-- For mobile users, the script also displays a QR code in the terminal. You can simply scan this QR code from your WireGuard mobile app to import the configuration instantly.
-- To check if tunneling is working, lookup your public IP address @ <https://ipinfo.io/ip>.
+This allocates the next free IPv4 and IPv6 addresses, writes the client
+configuration and PNG QR code beneath `/etc/wireguard/clients`, stores its keys
+beneath `/etc/wireguard/keys`, prints a terminal QR code, and reloads WireGuard
+without interrupting existing peers.
+
+IPv6 allocation expects the WireGuard interface to use a compressed `/64`
+address such as `fd12:3456:789a::1/64`. Managed client addresses use host IDs
+from `::2` through `::ffff` within that subnet.
+
+Client configuration files and PNG QR codes contain the client's private and
+preshared keys. Keep them confidential; the toolkit stores them with mode
+`600` beneath the root-only `/etc/wireguard` directory.
+
+List configured clients and live transfer data, sorted by IPv4 address:
 
 ```bash
-curl -s https://ipinfo.io | jq
+sudo wg-list-clients
 ```
 
-- Also check if your DNS lookups are leaking @ <https://www.dnsleaktest.com/>. We want all the traffic to flow through WireGuard secure tunnel and exit into public Internet, from our VPN server.
-- For setting up another WireGuard peer, SSH back into VPS, running WireGuard server, execute the script `setup_wireguard_client.sh` with `PEER_ID=3`. It should produce another WireGuard peer configuration file `peer3.conf`. You can import this peer configuration file in another WireGuard client app.
+Remove a client and all of its generated files:
 
 ```bash
-sudo ./setup_wireguard_client.sh 3
+sudo wg-remove-client iphone
 ```
 
-- Simply put, for every new WireGuard client you setup, you have to increment the `PEER_ID` by 1, to assign correct IP addresses to the peers. If you don't do that, tunneling won't work as expected. The WireGuard server gets `PEER_ID=1` allocated. You can keep incrementing till `PEER_ID=254`. Meaning it should allow you to attach at max 253 clients to the WireGuard server.
-- If you restart VPS, running WireGuard server, you have to reload the IPv4+IPv6 packet forwarding configuration, from `/etc/sysctl.conf`.
+Configuration changes are serialized with a lock. Adds and removals update
+`wg0.conf` atomically and roll back if the live `syncconf` reload fails.
 
-```bash
-sudo sysctl -p
+## Files
+
+```text
+/etc/wireguard/
+├── .toolkit.lock
+├── wg0.conf
+├── private.key
+├── public.key
+├── clients/
+│   ├── iphone.conf
+│   └── iphone.png
+└── keys/
+    ├── iphone.key
+    ├── iphone.pub
+    └── iphone.psk
 ```
 
-![sceen-capture-of-the-flow-of-setting-up-a-wireguard-server](./setup_wg.gif)
-
-> [!TIP]
-> Prefer to watch the walk through with some background music? Play [./setup_wg_with_bgm.mp4](./setup_wg_with_bgm.mp4) with your local media player.
-
-> [!NOTE]
-> This script is an implementation of the steps described in DigitalOcean blog post on "How To Set Up WireGuard on Ubuntu 20.04" @ <https://www.digitalocean.com/community/tutorials/how-to-set-up-wireguard-on-ubuntu-20-04>. This script makes the setup process much easier.
+The hidden `.toolkit.lock` file serializes management operations. After an
+unclean termination such as `SIGKILL` or a power loss, the installer and the
+add/remove commands warn about hidden transaction artifacts (`.wg0.conf.*`,
+`.remove-client.*`, or `.public.key.*`). The installer and mutation commands
+refuse to continue until these files are reviewed and recovered or removed
+manually; the toolkit does not delete potential recovery data automatically.

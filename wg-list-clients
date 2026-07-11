@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# List configured clients, joining wg0.conf comments with live wg data.
+set -euo pipefail
+IFS=$'\n\t'
+readonly CONFIG=/etc/wireguard/wg0.conf
+
+die() { printf 'wg-list-clients: %s\n' "$*" >&2; exit 1; }
+
+human_bytes() {
+    local value=$1 units=(B KiB MiB GiB TiB) unit=0
+    while (( value >= 1024 && unit < ${#units[@]} - 1 )); do
+        value=$((value / 1024)); ((unit += 1))
+    done
+    printf '%d %s' "$value" "${units[$unit]}"
+}
+
+store_peer() {
+    if (( ! active_peer )); then return 0; fi
+    [[ -n $peer_key ]] || die "client '$client_name' has no PublicKey in wg0.conf"
+    [[ -n $peer_ipv4 ]] || die "client '$client_name' has no IPv4 AllowedIPs entry in wg0.conf"
+    [[ -z ${names[$peer_key]+x} ]] || die "duplicate PublicKey in labelled peer blocks: $peer_key"
+    names["$peer_key"]=$client_name
+    ips["$peer_key"]=$peer_ipv4
+    active_peer=0
+    client_name=''
+}
+
+main() {
+    [[ ${EUID} -eq 0 ]] || die 'must be run as root'
+    declare -A names=() ips=() handshakes=() rx=() tx=() seen_client_names=()
+    local client_name='' peer_key='' peer_ipv4='' row key allowed timestamp in_bytes out_bytes handshake
+    local active_peer=0 dump_file
+
+    while IFS= read -r row; do
+        if [[ $row == '# Client: '* ]]; then
+            store_peer
+            client_name=${row#\# Client: }
+            [[ -n $client_name ]] || die 'empty client name in wg0.conf'
+            [[ -z ${seen_client_names[$client_name]+x} ]] || die "duplicate client name in wg0.conf: $client_name"
+            seen_client_names["$client_name"]=1
+            continue
+        fi
+        if [[ $row =~ ^[[:space:]]*\[([^]]+)\][[:space:]]*$ ]]; then
+            store_peer
+            if [[ ${BASH_REMATCH[1]} == Peer && -n $client_name ]]; then
+                active_peer=1; peer_key=''; peer_ipv4=''
+            else
+                client_name=''
+            fi
+            continue
+        fi
+        (( active_peer )) || continue
+        if [[ $row =~ ^[[:space:]]*PublicKey[[:space:]]*=[[:space:]]*([^[:space:]]+)[[:space:]]*$ ]]; then
+            peer_key=${BASH_REMATCH[1]}
+        elif [[ $row =~ ^[[:space:]]*AllowedIPs[[:space:]]*=[[:space:]]*(.+)$ ]]; then
+            while IFS= read -r allowed; do
+                allowed=${allowed//[[:space:]]/}
+                [[ $allowed == *.*/* ]] && { peer_ipv4=${allowed%/*}; break; }
+            done < <(tr ',' '\n' <<< "${BASH_REMATCH[1]}")
+        fi
+    done < "$CONFIG"
+    store_peer
+
+    dump_file=$(mktemp); trap 'rm -f "$dump_file"' EXIT
+    wg show wg0 dump > "$dump_file" || die 'unable to read live state from interface wg0'
+    while IFS=$'\t' read -r key _ _ allowed timestamp in_bytes out_bytes _; do
+        [[ -n ${key:-} ]] || continue
+        handshakes["$key"]=${timestamp:-0}; rx["$key"]=${in_bytes:-0}; tx["$key"]=${out_bytes:-0}
+        [[ -n ${ips[$key]:-} ]] || ips["$key"]=${allowed%%/*}
+    done < <(tail -n +2 "$dump_file")
+
+    printf '%-24s %-15s %-20s %12s %12s\n' 'Client' 'IPv4' 'Last Handshake' 'RX' 'TX'
+    while IFS=$'\t' read -r _ key; do
+        timestamp=${handshakes[$key]:-0}
+        if (( timestamp == 0 )); then
+            handshake='never'
+        else
+            handshake=$(date -d "@$timestamp" '+%Y-%m-%d %H:%M:%S')
+        fi
+        printf '%-24s %-15s %-20s %12s %12s\n' "${names[$key]}" "${ips[$key]}" "$handshake" \
+            "$(human_bytes "${rx[$key]:-0}")" "$(human_bytes "${tx[$key]:-0}")"
+    done < <(
+        for key in "${!names[@]}"; do printf '%s\t%s\n' "${ips[$key]}" "$key"; done |
+            sort -t $'\t' -k1,1V
+    )
+    rm -f "$dump_file"
+    trap - EXIT
+}
+main "$@"

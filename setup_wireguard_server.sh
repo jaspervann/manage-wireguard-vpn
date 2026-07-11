@@ -1,203 +1,330 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# Install and configure a small, file-based WireGuard management toolkit.
+# Supported platforms: Debian 12+ and Ubuntu 22.04+.
 
-# BASH script for easily setting up WireGuard VPN Server and Clients
-# Author: Anjan Roy | September, 2025
-# Repository: https://github.com/itzmeanjan/setup-wireguard-vpn
-# License: BSD 3-Clause License
-#
-# I have been using WireGuard as my personal VPN solution for couple of years now.
-# Before that I fiddled around with OpenVPN, sometimes it worked and sometimes it did not. I didn't actually like it.
-# WireGuard is simple and efficient. It just works. Originally I found a really helpful blog post on DigitalOcean,
-# titled "How To Set Up WireGuard on Ubuntu 20.04" @ https://www.digitalocean.com/community/tutorials/how-to-set-up-wireguard-on-ubuntu-20-04.
-# I followed it step by step to setup my first WireGuard server. But running those same set of commands
-# again and again is not really charming! Hence this is an attempt to partially automate setup of new
-# WireGuard server on Ubuntu, running on some cloud service provider's shared infra or my little Raspberry Pi.
-# I mostly use Ubuntu or Debian as my choice of OS for running servers. But it should not be very hard for one
-# to tweak it to support other Linux distributions.
-#
-# This script doesn't intend to replace DigitalOcean's above linked guide by any means,
-# rather it attempts to make it easy when one needs to run those commands again and again.
-# A curious soul should definitely go and check the original guide out. DigitalOcean has some of the
-# best written guides in Devops domain, so definitely a huge respect for what they are putting out there.
-#
-# How is one supposed to use it?
-#
-# - Go to AWS or DigitalOcean to grab a Linux VM.
-# - Transfer this little BASH script to that machine.
-# - Execute this script `$ sudo bash setup_wireguard_server.sh`.
-# - Successful execution should produce another script in the same directory, named `setup_wireguard_client.sh`.
-# - Running `sudo wg` should show you the status of running WireGuard server.
-# - Go ahead and open default WireGuard server port 51820 in VM provider's firewall configuration page for both IPv4 and IPv6 network stacks.
-# - For DNS, HTTP, HTTPS and other protocol traffic, you have to open those ports too.
-# - Now that our WireGuard server should be ready to accept traffic, let's setup clients.
-# - We can use our generated BASH script `setup_wireguard_client.sh` to setup as many peers as possible.
-# - For setting up first peer, execute the script with `PEER_ID` set to 2 i.e. `$ sudo bash setup_wireguard_client.sh 2`.
-# - For each next peer, bump `PEER_ID`, like `$ sudo bash setup_wireguard_client.sh 3`.
-# - Ideally, for every new peer that you want to add to this WireGuard server, one will increment that number by 1, starting from 2, until it reaches 254.
-# - In essence, for this WireGuard server that you just setup, you can connect upto 253 peers.
-# - Now go ahead and execute the client setup script, with your desired `PEER_ID`, grab the `peer_.conf` file it just output. `_` is `PEER_ID`.
-# - Finally, you can use this peer configuration file in your mobile or desktop WireGuard clients.
-#
-# A blog post @ https://itzmeanjan.in/pages/host-your-own-vpn_server.html. Enjoy WireGuard!
+set -euo pipefail
+IFS=$'\n\t'
 
-echo "[+] This BASH script helps you setup WireGuard VPN server and clients."
-read -p "[?] Have you read this script and understand what it does to your system? (y/n): " response
-if [[ "$response" != "y" && "$response" != "Y" ]]; then
-    echo "[!] Please go through the script before running it. Exiting."
+readonly WG_DIR=/etc/wireguard
+readonly WG_CONFIG=/etc/wireguard/wg0.conf
+readonly BIN_DIR=/usr/local/bin
+readonly SYSCTL_FILE=/etc/sysctl.d/99-wireguard-forwarding.conf
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+readonly SCRIPT_DIR
+[[ -r $SCRIPT_DIR/wireguard-toolkit-common.sh ]] || {
+    printf '[!] Missing shared library: %s\n' "$SCRIPT_DIR/wireguard-toolkit-common.sh" >&2
     exit 1
-fi
-echo "[+] Going ahead with setting up WireGuard server."
+}
+# shellcheck source=wireguard-toolkit-common.sh
+source "$SCRIPT_DIR/wireguard-toolkit-common.sh"
 
-echo "[+] Updating system and installing WireGuard."
-sudo apt-get update
-sudo apt-get install wireguard qrencode -y
+log() { printf '[+] %s\n' "$*"; }
+die() { printf '[!] %s\n' "$*" >&2; exit 1; }
 
-echo "[+] Generating WireGuard server private + public keypair."
-WG_PRIV_KEY=$(wg genkey)
-WG_PUB_KEY=$(echo $WG_PRIV_KEY | wg pubkey)
+require_root() {
+    [[ ${EUID} -eq 0 ]] || die "Run this installer as root (for example: sudo $0)."
+}
 
-echo "[+] Writing WireGuard server private + public keypair to respective files."
-echo $WG_PRIV_KEY | sudo tee /etc/wireguard/private.key
-echo $WG_PUB_KEY | sudo tee /etc/wireguard/public.key
+check_platform() {
+    # shellcheck source=/dev/null
+    source /etc/os-release
+    case ${ID:-} in
+        debian) (( ${VERSION_ID%%.*} >= 12 )) || die 'Debian 12 or newer is required.' ;;
+        ubuntu) (( ${VERSION_ID%%.*} >= 22 )) || die 'Ubuntu 22.04 or newer is required.' ;;
+        *) die 'Only Debian 12+ and Ubuntu 22.04+ are supported.' ;;
+    esac
+}
 
-sudo chmod go= /etc/wireguard/private.key
+install_packages() {
+    log 'Installing WireGuard and qrencode.'
+    apt-get update
+    DEBIAN_FRONTEND=noninteractive apt-get install -y \
+        wireguard qrencode iptables iproute2 util-linux coreutils mawk sed grep procps
+}
 
-echo "[+] Computing pseudo-random IPv6 address prefix."
-WG_PUB_KEY_HEX=$(echo $WG_PUB_KEY | basenc -d --base64 | basenc --base16 | tr '[:upper:]' '[:lower:]')
-IPV6_ADDRESS=$(printf "fd%s:%s:%s::1/64" $(echo $WG_PUB_KEY_HEX | cut -c 55-56) $(echo $WG_PUB_KEY_HEX | cut -c 57-60) $(echo $WG_PUB_KEY_HEX | cut -c 61-64))
-WG_CONFIG_FILE="/etc/wireguard/wg0.conf"
+validate_command_sources() {
+    local script_dir command
+    script_dir=$SCRIPT_DIR
+    for command in wg-add-client wg-remove-client wg-list-clients wireguard-toolkit-common.sh; do
+        [[ -f $script_dir/$command && -r $script_dir/$command ]] || \
+            die "Required command file is missing or unreadable: $script_dir/$command"
+        bash -n "$script_dir/$command" || die "Command file has invalid Bash syntax: $script_dir/$command"
+    done
+}
 
-echo "[+] Figuring out publicly visible IPv4 address of WireGuard server."
-PUBLIC_IP_OF_WG_SERVER=$(curl -s ipinfo.io/ip)
+validate_bootstrap_tools() {
+    local command
+    for command in awk grep sed tr install flock; do
+        command -v "$command" >/dev/null 2>&1 || \
+            die "Required base-system command is unavailable: $command"
+    done
+}
 
-echo "[+] Writing WireGuard server's initial configuration file."
-cat << EOF > $WG_CONFIG_FILE
+warn_stale_artifacts() {
+    local artifact
+    local -a artifacts=()
+    shopt -s nullglob
+    artifacts=("$WG_DIR"/.wg0.conf.* "$WG_DIR"/.remove-client.* "$WG_DIR"/.public.key.*)
+    shopt -u nullglob
+    for artifact in "${artifacts[@]}"; do
+        printf '[!] Stale transaction artifact found; review it manually: %s\n' "$artifact" >&2
+    done
+    (( ${#artifacts[@]} == 0 )) || die 'Refusing to continue while stale transaction artifacts exist.'
+}
+
+detect_external_interface() {
+    ip -4 route show default | awk '{ for (i = 1; i <= NF; i++) if ($i == "dev") { print $(i + 1); exit } }'
+}
+
+detect_endpoint() {
+    local endpoint=${WG_ENDPOINT:-}
+    if [[ -n $endpoint ]]; then
+        validate_endpoint "$endpoint"
+        printf '%s\n' "$endpoint"
+        return 0
+    fi
+
+    endpoint=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{ for (i = 1; i <= NF; i++) if ($i == "src") { print $(i + 1); exit } }')
+    [[ -n $endpoint ]] || die 'Unable to detect an endpoint. Set WG_ENDPOINT to the public IP or hostname.'
+    is_public_ipv4 "$endpoint" || die "Detected endpoint '$endpoint' is not a public IPv4 address. Set WG_ENDPOINT to the public IP or hostname."
+    validate_endpoint "$endpoint"
+    printf '%s\n' "$endpoint"
+}
+
+
+is_public_ipv4() {
+    local ip=$1 a b c d
+    IFS=. read -r a b c d <<< "$ip"
+    [[ $a =~ ^[0-9]+$ && $b =~ ^[0-9]+$ && $c =~ ^[0-9]+$ && $d =~ ^[0-9]+$ ]] || return 1
+    (( a <= 255 && b <= 255 && c <= 255 && d <= 255 )) || return 1
+    (( a != 0 && a != 10 && a != 127 && a < 224 )) || return 1
+    (( a != 169 || b != 254 )) || return 1
+    (( a != 172 || b < 16 || b > 31 )) || return 1
+    (( a != 192 || b != 168 )) || return 1
+    (( a != 100 || b < 64 || b > 127 )) || return 1
+}
+
+prepare_server_private_key() {
+    if [[ -e $WG_CONFIG && ! -s $WG_DIR/private.key ]]; then
+        die "$WG_CONFIG exists but $WG_DIR/private.key is missing or empty. Refusing to generate a mismatched server key."
+    fi
+    if [[ ! -s $WG_DIR/private.key ]]; then
+        umask 077
+        wg genkey > "$WG_DIR/private.key"
+    fi
+    chmod 600 "$WG_DIR/private.key"
+}
+
+config_value() {
+    local key=$1
+    awk -v key="$key" '
+        $0 ~ "^[[:space:]]*" key "[[:space:]]*=" {
+            value=substr($0, index($0, "=") + 1)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+            print value
+            exit
+        }
+    ' "$WG_CONFIG"
+}
+
+
+validate_existing_config_structure() {
+    [[ -e $WG_CONFIG ]] || return 0
+    local addresses listen_port endpoint ipv4_cidr ipv4 bits value base size ipv6_cidr
+
+    grep -Eiq '^[[:space:]]*SaveConfig[[:space:]]*=[[:space:]]*(true|yes|1)[[:space:]]*$' "$WG_CONFIG" && \
+        die "$WG_CONFIG must not enable SaveConfig."
+    addresses=$(awk -F= '/^[[:space:]]*Address[[:space:]]*=/ { printf "%s%s", separator, $2; separator="," } END { print "" }' "$WG_CONFIG")
+    ipv4_cidr=$(tr ',' '\n' <<< "$addresses" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | awk 'index($0, ".") { print; exit }')
+    [[ $ipv4_cidr == */* ]] || die "$WG_CONFIG must contain an IPv4 interface address."
+    ipv4=${ipv4_cidr%/*}; bits=${ipv4_cidr#*/}
+    [[ $bits =~ ^[0-9]+$ ]] || die "$WG_CONFIG contains an invalid IPv4 prefix."
+    bits=$((10#$bits))
+    (( bits >= 1 && bits <= 30 )) || die "$WG_CONFIG IPv4 prefix must be between /1 and /30."
+    value=$(ipv4_to_int "$ipv4") || die "$WG_CONFIG contains an invalid IPv4 interface address."
+    base=$(( value & (0xFFFFFFFF << (32 - bits)) )); size=$((1 << (32 - bits)))
+    (( value > base && value < base + size - 1 )) || \
+        die "$WG_CONFIG IPv4 interface address must not be the network or broadcast address."
+    ipv6_cidr=$(tr ',' '\n' <<< "$addresses" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | awk 'index($0, ":") { print; exit }')
+    [[ $ipv6_cidr == */64 && ${ipv6_cidr%/*} == *::* ]] || \
+        die "$WG_CONFIG must contain a compressed /64 IPv6 interface address."
+    normalize_ipv6 "${ipv6_cidr%/*}" >/dev/null || die "$WG_CONFIG contains an invalid IPv6 interface address."
+    listen_port=$(config_value ListenPort)
+    if ! [[ $listen_port =~ ^[1-9][0-9]{0,4}$ ]] || ! (( 10#$listen_port <= 65535 )); then
+        die "$WG_CONFIG must contain a numeric ListenPort between 1 and 65535."
+    fi
+    endpoint=$(sed -n 's/^# Endpoint: //p' "$WG_CONFIG" | head -n 1)
+    [[ -n $endpoint ]] || die "$WG_CONFIG must contain a '# Endpoint: HOST' comment."
+    validate_endpoint "$endpoint"
+    [[ -n $(config_value PrivateKey) ]] || die "$WG_CONFIG must contain an interface PrivateKey."
+    awk '
+        /^# Client: / {
+            name=substr($0, 11)
+            if (length(name) > 64 || name !~ /^[A-Za-z0-9][A-Za-z0-9_-]*$/) {
+                print "Invalid client comment: " name > "/dev/stderr"; exit 1
+            }
+            if (++seen[name] > 1) { print "Duplicate client comment: " name > "/dev/stderr"; exit 1 }
+        }
+    ' "$WG_CONFIG" || die "$WG_CONFIG contains duplicate client names."
+}
+
+
+validate_existing_server_key() {
+    [[ -e $WG_CONFIG ]] || return 0
+    local config_private expected_public config_public
+    config_private=$(config_value PrivateKey)
+    [[ -n $config_private ]] || die "$WG_CONFIG must contain an interface PrivateKey."
+    expected_public=$(wg pubkey < "$WG_DIR/private.key")
+    config_public=$(wg pubkey <<< "$config_private" 2>/dev/null) || die "$WG_CONFIG contains an invalid PrivateKey."
+    [[ $config_public == "$expected_public" ]] || \
+        die "The PrivateKey in $WG_CONFIG does not match $WG_DIR/private.key."
+}
+
+write_server_public_key() {
+    local public_key temporary
+    public_key=$(wg pubkey < "$WG_DIR/private.key")
+    temporary=$(mktemp "$WG_DIR/.public.key.XXXXXX")
+    trap 'rm -f "$temporary"' EXIT
+    trap 'rm -f "$temporary"; exit 130' INT TERM HUP
+    if ! printf '%s\n' "$public_key" > "$temporary" || \
+        ! chmod 644 "$temporary" || ! mv "$temporary" "$WG_DIR/public.key"; then
+        die "Unable to write $WG_DIR/public.key."
+    fi
+    trap - EXIT INT TERM HUP
+}
+
+has_nat_rule() {
+    local phase=$1 tool=$2 action=$3 external_interface=$4
+    awk -F= -v phase="$phase" -v tool="$tool" -v action="$action" -v interface="$external_interface" '
+        $1 ~ "^[[:space:]]*" phase "[[:space:]]*$" {
+            count=split($2, token, /[[:space:]]+/)
+            for (index=1; index <= count - 8; index++) {
+                if (token[index] == tool && token[index+1] == "-t" && token[index+2] == "nat" &&
+                    token[index+3] == action && token[index+4] == "POSTROUTING" &&
+                    token[index+5] == "-o" && token[index+6] == interface &&
+                    token[index+7] == "-j" && token[index+8] == "MASQUERADE") { found=1; exit }
+            }
+        }
+        END { exit(found ? 0 : 1) }
+    ' "$WG_CONFIG"
+}
+
+validate_existing_nat() {
+    [[ -e $WG_CONFIG ]] || return 0
+    local external_interface=$1
+    if ! has_nat_rule PostUp iptables -A "$external_interface" && \
+        ! has_nat_rule PostUp iptables -I "$external_interface"; then
+        die "$WG_CONFIG requires: iptables -t nat -A POSTROUTING -o $external_interface -j MASQUERADE"
+    fi
+    if ! has_nat_rule PostUp ip6tables -A "$external_interface" && \
+        ! has_nat_rule PostUp ip6tables -I "$external_interface"; then
+        die "$WG_CONFIG requires: ip6tables -t nat -A POSTROUTING -o $external_interface -j MASQUERADE"
+    fi
+    has_nat_rule PreDown iptables -D "$external_interface" || \
+        die "$WG_CONFIG requires: iptables -t nat -D POSTROUTING -o $external_interface -j MASQUERADE"
+    has_nat_rule PreDown ip6tables -D "$external_interface" || \
+        die "$WG_CONFIG requires: ip6tables -t nat -D POSTROUTING -o $external_interface -j MASQUERADE"
+}
+
+derive_ipv6_prefix() {
+    local hex
+    hex=$(wg pubkey < "$WG_DIR/private.key" | base64 -d | od -An -tx1 | tr -d ' \n')
+    printf 'fd%s:%s:%s\n' "${hex:26:2}" "${hex:28:4}" "${hex:32:4}"
+}
+
+write_server_config() {
+    local external_interface=$1 endpoint=$2 ipv6_prefix=$3 private_key
+    private_key=$(<"$WG_DIR/private.key")
+
+    if [[ -e $WG_CONFIG ]]; then
+        log "Keeping existing $WG_CONFIG."
+        return
+    fi
+
+    umask 077
+    cat > "$WG_CONFIG" <<EOF
+# Managed by the WireGuard management toolkit. Peer blocks may be edited manually.
+# Endpoint: ${endpoint}
 [Interface]
-PrivateKey = $WG_PRIV_KEY
-Address = 10.8.0.1/24, $IPV6_ADDRESS
+PrivateKey = ${private_key}
+Address = 10.8.0.1/24, ${ipv6_prefix}::1/64
 ListenPort = 51820
 MTU = 1420
-SaveConfig = true
+PostUp = iptables -t nat -C POSTROUTING -o ${external_interface} -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o ${external_interface} -j MASQUERADE
+PostUp = ip6tables -t nat -C POSTROUTING -o ${external_interface} -j MASQUERADE 2>/dev/null || ip6tables -t nat -A POSTROUTING -o ${external_interface} -j MASQUERADE
+PreDown = iptables -t nat -D POSTROUTING -o ${external_interface} -j MASQUERADE 2>/dev/null || true
+PreDown = ip6tables -t nat -D POSTROUTING -o ${external_interface} -j MASQUERADE 2>/dev/null || true
 EOF
+    chmod 600 "$WG_CONFIG"
+}
 
-echo "[+] Updating WireGuard server's network configuration to forward both IPv4 and IPv6 traffic."
-echo "net.ipv4.ip_forward=1" | sudo tee -a /etc/sysctl.conf
-echo "net.ipv6.conf.all.forwarding=1" | sudo tee -a /etc/sysctl.conf
-sudo sysctl -p
-
-echo "[+] Updating WireGuard server configuration file to add firewall rules."
-INTERFACE=$(ip route list default | awk '{for (i=1; i<=NF; i++) if ($i == "dev") {print $(i+1); exit}}')
-
-{
-    printf "PostUp = ufw route allow in on wg0 out on %s\n" "$INTERFACE"
-    printf "PostUp = iptables -t nat -I POSTROUTING -o %s -j MASQUERADE\n" "$INTERFACE"
-    printf "PostUp = ip6tables -t nat -I POSTROUTING -o %s -j MASQUERADE\n" "$INTERFACE"
-    printf "PreDown = ufw route delete allow in on wg0 out on %s\n" "$INTERFACE"
-    printf "PreDown = iptables -t nat -D POSTROUTING -o %s -j MASQUERADE\n" "$INTERFACE"
-    printf "PreDown = ip6tables -t nat -D POSTROUTING -o %s -j MASQUERADE\n" "$INTERFACE"
-} >> "$WG_CONFIG_FILE"
-
-sudo ufw allow 51820/udp
-sudo ufw allow OpenSSH
-
-sudo ufw disable
-sudo ufw enable
-sudo ufw status
-
-echo "[+] Enabling and starting the WireGuard server with systemd."
-sudo systemctl enable wg-quick@wg0.service
-sudo systemctl start wg-quick@wg0.service
-sudo systemctl status wg-quick@wg0.service
-
-echo "[+] Wireguard server should be running."
-sudo wg
-
-# ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-
-echo "[+] Generating WireGuard client setup BASH script."
-WG_CLIENT_SETUP_SCRIPT="setup_wireguard_client.sh"
-
-# We use 'EOF' (with single quotes) to prevent the shell from expanding
-# variables within this block. This treats the entire block as a literal string.
-# We then use `sed` to selectively replace the placeholders we need with
-# values from our running server script.
-cat << 'EOF' > "$WG_CLIENT_SETUP_SCRIPT"
-#!/bin/bash
-
-# This script is generated by the WireGuard server setup script.
-# It helps you add new peers (clients) to the WireGuard server.
-#
-# For setting up first WireGuard peer, simply execute this script `$ sudo bash setup_wireguard_client.sh 2` s.t.
-# PEER_ID is 2. After this, for every new client, be sure to increment `PEER_ID` by 1 and execute the script,
-# like `$ sudo bash setup_wireguard_client.sh 3`. You can continue doing this till `PEER_ID=254`.
-
-echo "[+] This BASH script helps you setup a WireGuard VPN client."
-read -p "[?] Have you read this script and understand what it does? (y/n): " response
-if [[ "$response" != "y" && "$response" != "Y" ]]; then
-    echo "[!] Please go through the script before running it. Exiting."
-    exit 1
-fi
-echo "[+] Going ahead with setting up a WireGuard client."
-
-# For the first peer, keep PEER_ID=2.
-# For every new peer, increment this number by 1.
-# The max value can be 254.
-# It allows you to add at max 253 peers to a WireGuard server.
-# Default peer-id is set to 2. You can either increment "2" by editing the script itself or
-# pass preferred peer-id when invoking the wireguard client setup script.
-PEER_ID=${1:- "2"}
-echo "[+] Setting up WireGuard peer with ID: $PEER_ID."
-
-echo "[+] Generating WireGuard peer private + public keypair."
-PEER_PRIV_KEY=$(wg genkey)
-PEER_PUB_KEY=$(echo $PEER_PRIV_KEY | wg pubkey)
-
-# These placeholders will be replaced by the server script
-SERVER_PUB_KEY="__SERVER_PUB_KEY__"
-SERVER_ENDPOINT="__SERVER_ENDPOINT__"
-SERVER_IPV6_ADDRESS="__SERVER_IPV6_ADDRESS__"
-
-# Calculate peer-specific IP addresses
-PEER_IPV4_ADDRESS="10.8.0.$PEER_ID/32"
-PEER_IPV6_ADDRESS=$(echo $SERVER_IPV6_ADDRESS | sed "s|1/64$|${PEER_ID}/128|")
-
-CONFIG_FILE="peer$PEER_ID.conf"
-
-echo "[+] Writing WireGuard peer configuration to '$CONFIG_FILE'."
-cat << EOF_CLIENT > "$CONFIG_FILE"
-[Interface]
-PrivateKey = $PEER_PRIV_KEY
-Address = $PEER_IPV4_ADDRESS
-Address = $PEER_IPV6_ADDRESS
-DNS = 1.1.1.1, 1.0.0.1, 2606:4700:4700::1111, 2606:4700:4700::1001
-MTU = 1420
-
-[Peer]
-PublicKey = $SERVER_PUB_KEY
-AllowedIPs = 0.0.0.0/0, ::/0
-Endpoint = $SERVER_ENDPOINT:51820
-PersistentKeepalive = 25
-EOF_CLIENT
-
-echo "[+] Adding peer to the WireGuard server configuration."
-sudo wg set wg0 peer "$PEER_PUB_KEY" allowed-ips "$PEER_IPV4_ADDRESS,$PEER_IPV6_ADDRESS"
-
-echo "[+] WireGuard peer configuration file '$CONFIG_FILE' is ready."
-echo "[+] Use it with your WireGuard client application."
-echo "[+] Alternatively, scan the QR code below from your WireGuard mobile app."
-qrencode -t ansiutf8 < "$CONFIG_FILE"
+enable_forwarding() {
+    cat > "$SYSCTL_FILE" <<'EOF'
+# Required for routing traffic between WireGuard and the public interface.
+net.ipv4.ip_forward = 1
+net.ipv6.conf.all.forwarding = 1
 EOF
+    sysctl -p "$SYSCTL_FILE" >/dev/null
+}
 
-# Now, use `sed` to substitute the placeholder values with the actual
-# variables from the server script. This is a safer and clearer way
-# to inject server-side variables into the generated script.
-sed -i "s|__SERVER_PUB_KEY__|$WG_PUB_KEY|" "$WG_CLIENT_SETUP_SCRIPT"
-sed -i "s|__SERVER_ENDPOINT__|$PUBLIC_IP_OF_WG_SERVER|" "$WG_CLIENT_SETUP_SCRIPT"
-sed -i "s|__SERVER_IPV6_ADDRESS__|$IPV6_ADDRESS|" "$WG_CLIENT_SETUP_SCRIPT"
+configure_ufw() {
+    local external_interface=$1
+    local listen_port
 
-# -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+    # Do not install or enable UFW. If the administrator already uses it, add
+    # only the rules required for WireGuard and preserve all existing policy.
+    command -v ufw >/dev/null 2>&1 || return 0
+    LC_ALL=C ufw status 2>/dev/null | grep -q '^Status: active' || return 0
 
-sudo chmod +x $WG_CLIENT_SETUP_SCRIPT
+    listen_port=$(awk -F= '/^[[:space:]]*ListenPort[[:space:]]*=/ { gsub(/[[:space:]]/, "", $2); print $2; exit }' "$WG_CONFIG")
+    if ! [[ $listen_port =~ ^[1-9][0-9]{0,4}$ ]] || ! (( 10#$listen_port <= 65535 )); then
+        die "Unable to determine a valid ListenPort from $WG_CONFIG."
+    fi
+    log 'Active UFW firewall detected; allowing WireGuard traffic.'
+    ufw allow "$listen_port/udp" comment 'WireGuard'
+    ufw route allow in on wg0 out on "$external_interface" comment 'WireGuard forwarding'
+}
 
-echo "[+] WireGuard client setup script '$WG_CLIENT_SETUP_SCRIPT' should be ready to use."
-echo "[+] Go ahead and give it a read, before you run it."
+
+install_commands() {
+    local script_dir
+    script_dir=$SCRIPT_DIR
+    install -d -m 755 /usr/local/lib/wireguard-toolkit
+    install -m 644 "$script_dir/wireguard-toolkit-common.sh" /usr/local/lib/wireguard-toolkit/common.sh
+    install -m 755 "$script_dir/wg-add-client" "$BIN_DIR/wg-add-client"
+    install -m 755 "$script_dir/wg-remove-client" "$BIN_DIR/wg-remove-client"
+    install -m 755 "$script_dir/wg-list-clients" "$BIN_DIR/wg-list-clients"
+}
+
+main() {
+    require_root
+    check_platform
+    validate_command_sources
+    validate_bootstrap_tools
+    install -d -m 700 "$WG_DIR" "$WG_DIR/clients" "$WG_DIR/keys"
+    exec 8>"$WG_DIR/.toolkit.lock"; flock -x 8
+    validate_existing_config_structure
+    warn_stale_artifacts
+    install_packages
+    prepare_server_private_key
+    validate_existing_server_key
+    local interface endpoint prefix
+    interface=$(detect_external_interface)
+    [[ -n $interface ]] || die 'Unable to find the default network interface.'
+    validate_existing_nat "$interface"
+    if [[ -e $WG_CONFIG ]]; then
+        endpoint=$(sed -n 's/^# Endpoint: //p' "$WG_CONFIG" | head -n 1)
+    else
+        endpoint=$(detect_endpoint)
+    fi
+    write_server_public_key
+    prefix=$(derive_ipv6_prefix)
+    write_server_config "$interface" "$endpoint" "$prefix"
+    enable_forwarding
+    configure_ufw "$interface"
+    install_commands
+    systemctl enable --now wg-quick@wg0.service
+    log 'WireGuard is ready. Add a client with: sudo wg-add-client CLIENT'
+}
+
+main "$@"

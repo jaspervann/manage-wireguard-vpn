@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+# Remove a named WireGuard client and its generated files.
+set -euo pipefail
+IFS=$'\n\t'
+readonly WG_DIR=/etc/wireguard CONFIG=/etc/wireguard/wg0.conf
+die() { printf 'wg-remove-client: %s\n' "$*" >&2; exit 1; }
+sync_config() { wg syncconf wg0 <(wg-quick strip wg0); }
+cleanup() {
+    local status=$?
+    local config_restore_failed=0 quarantine_restore_failed=0
+    trap - EXIT INT TERM HUP
+    if (( ! committed && config_replaced )) && [[ -n ${backup:-} && -e $backup ]]; then
+        if cp -a "$backup" "$CONFIG"; then
+            if ! sync_config >/dev/null 2>&1; then
+                printf 'wg-remove-client: WARNING: wg0.conf was restored, but the live interface could not be restored; run: wg syncconf wg0 <(wg-quick strip wg0)\n' >&2
+                config_restore_failed=1
+            fi
+        else
+            printf 'wg-remove-client: WARNING: failed to restore wg0.conf; recovery backup remains at %s\n' "$backup" >&2
+            config_restore_failed=1
+        fi
+    fi
+    if (( ! committed )) && [[ -n ${quarantine:-} && -d $quarantine ]]; then
+        restore_quarantined_files || quarantine_restore_failed=1
+    fi
+    rm -f "${tmp:-}"
+    if (( ! config_restore_failed )); then rm -f "${backup:-}"; backup=''; fi
+    if (( quarantine_restore_failed )); then
+        printf 'wg-remove-client: WARNING: some client files could not be restored; recovery files remain at %s\n' "$quarantine" >&2
+    elif [[ -n ${quarantine:-} && -d $quarantine ]]; then
+        rm -rf -- "$quarantine"
+    fi
+    exit "$status"
+}
+
+quarantine_file() {
+    local source=$1 destination=$2
+    if [[ -e $source ]]; then mv "$source" "$quarantine/$destination/"; fi
+}
+
+restore_quarantined_files() {
+    local file failed=0
+    for file in "$quarantine/keys/"*; do
+        if [[ -e $file ]] && ! mv "$file" "$WG_DIR/keys/"; then failed=1; fi
+    done
+    for file in "$quarantine/clients/"*; do
+        if [[ -e $file ]] && ! mv "$file" "$WG_DIR/clients/"; then failed=1; fi
+    done
+    (( failed == 0 ))
+}
+
+warn_stale_artifacts() {
+    local artifact
+    local -a artifacts=()
+    shopt -s nullglob
+    artifacts=("$WG_DIR"/.wg0.conf.* "$WG_DIR"/.remove-client.* "$WG_DIR"/.public.key.*)
+    shopt -u nullglob
+    for artifact in "${artifacts[@]}"; do
+        printf 'wg-remove-client: WARNING: stale transaction artifact found; review it manually: %s\n' "$artifact" >&2
+    done
+    (( ${#artifacts[@]} == 0 )) || die 'refusing to continue while stale transaction artifacts exist'
+}
+
+main() {
+    [[ ${EUID} -eq 0 ]] || die 'must be run as root'
+    [[ $# -eq 1 ]] || die 'usage: wg-remove-client CLIENT'
+    local name=$1 tmp backup quarantine matches committed=0 config_replaced=0
+    [[ $name =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$ ]] || die 'invalid client name'
+    exec 9>"$WG_DIR/.toolkit.lock"; flock -x 9
+    warn_stale_artifacts
+    matches=$(awk -v marker="# Client: $name" '$0 == marker { count++ } END { print count + 0 }' "$CONFIG")
+    (( matches > 0 )) || die "client '$name' does not exist"
+    (( matches == 1 )) || die "client '$name' appears more than once in wg0.conf; refusing ambiguous removal"
+    tmp=$(mktemp "$WG_DIR/.wg0.conf.XXXXXX"); backup=''; quarantine=''
+    trap cleanup EXIT
+    trap 'exit 130' INT TERM HUP
+    awk -v marker="# Client: $name" '
+        $0 == marker { dropping=1; next }
+        dropping && !in_peer && $0 ~ /^[[:space:]]*\[Peer\][[:space:]]*$/ { in_peer=1; next }
+        dropping && in_peer && (/^# Client: / || /^[[:space:]]*\[/) { dropping=0; in_peer=0 }
+        !dropping { print }
+        END { if (dropping && !in_peer) exit 2 }
+    ' "$CONFIG" > "$tmp"
+    # Trim trailing blank lines while preserving the readable peer layout.
+    sed -i -e :a -e '/^\n*$/{$d;N;ba}' "$tmp"
+    printf '\n' >> "$tmp"; chmod 600 "$tmp"
+    quarantine=$(mktemp -d "$WG_DIR/.remove-client.XXXXXX")
+    mkdir "$quarantine/keys" "$quarantine/clients"
+    quarantine_file "$WG_DIR/keys/$name.key" keys
+    quarantine_file "$WG_DIR/keys/$name.pub" keys
+    quarantine_file "$WG_DIR/keys/$name.psk" keys
+    quarantine_file "$WG_DIR/clients/$name.conf" clients
+    quarantine_file "$WG_DIR/clients/$name.png" clients
+    backup=$(mktemp "$WG_DIR/.wg0.conf.backup.XXXXXX")
+    cp -a "$CONFIG" "$backup"
+    config_replaced=1
+    mv "$tmp" "$CONFIG"
+    if ! sync_config; then die 'reload failed; changes were rolled back'; fi
+    committed=1
+    rm -rf -- "$quarantine"; quarantine=''
+    rm -f "$backup"; backup=''
+    trap - EXIT INT TERM HUP
+    printf "Client '%s' removed.\n" "$name"
+}
+main "$@"
